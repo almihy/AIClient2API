@@ -422,9 +422,50 @@ function parseMultipartForm(req) {
 }
 
 /**
+ * Build the user-facing prompt with a positional role suffix when the
+ * request carries more than just the primary image. Single-image
+ * requests are passed through verbatim so existing callers see no
+ * behavior change. The suffix is appended on its own line so it doesn't
+ * collide with prompts that already end mid-sentence.
+ */
+function buildPromptWithImageRoles({ prompt, refCount, hasMask }) {
+    if (refCount === 0 && !hasMask) return prompt;
+
+    // Position 1 is always the source. Refs occupy 2..(1+refCount). Mask,
+    // when present, is always the last position.
+    const lines = ['', '— Image roles:', 'Image 1 is the source to edit.'];
+    if (refCount > 0) {
+        const start = 2;
+        const end = 1 + refCount;
+        const range = start === end ? `Image ${start}` : `Images ${start}–${end}`;
+        lines.push(
+            `${range} ${refCount === 1 ? 'is a' : 'are'} style reference${refCount === 1 ? '' : 's'} — match materials, palette, lighting, and atmosphere where relevant; do not copy their composition.`,
+        );
+    }
+    if (hasMask) {
+        lines.push(
+            'The final image is a black-and-white mask. Only modify pixels in Image 1 where the mask is white; preserve all other pixels exactly.',
+        );
+    }
+    return `${prompt}\n${lines.join('\n')}`;
+}
+
+/**
  * Handle POST /v1/images/edits - OpenAI 标准改图接口
- * Accepts multipart/form-data: image (required), prompt (required),
- * mask (ignored), model, n, size, response_format
+ * Accepts multipart/form-data:
+ *   - image (required) — primary input image to be edited
+ *   - image1, image2, … imageN (optional) — additional reference images
+ *     appended as extra image_url content parts so vision-capable models
+ *     can condition on multiple inputs (Gemini, Claude). Capped at
+ *     IMAGE_EDITS_MAX_REFS to bound token cost.
+ *   - mask (optional) — black-and-white inpaint mask (white = edit,
+ *     black = preserve). Appended as the LAST image_url part and a
+ *     positional instruction is added to the prompt so the model knows
+ *     to treat it as a mask rather than another reference. This is the
+ *     supported pattern for Gemini-family image models (Nano Banana /
+ *     gemini-3.*-image): they don't accept a separate mask field, but
+ *     they do follow B&W mask-as-image-part with an explicit text cue.
+ *   - prompt (required), model, n, size, response_format
  */
 async function handleImageEditsRequest(req, res, currentConfig, providerPoolManager) {
     let slotProviderType = null;
@@ -442,7 +483,18 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
         // 兼容 image[] 字段名（LiteLLM 发送的是 image[]，OpenAI 标准是 image）
         const imageFile = files.image || files['image[]'];
 
-        logger.info(`[Image Edits] Received request: model=${model}, n=${n}, response_format=${response_format}, hasPrompt=${!!prompt}, hasImage=${!!imageFile}${size ? `, size=${size}` : ''}, fields=${JSON.stringify(Object.keys(fields))}, fileKeys=${JSON.stringify(Object.keys(files))}`);
+        // Reference images: image1..imageN. Collected in numeric order so
+        // callers control prioritization; gaps in numbering are tolerated.
+        const IMAGE_EDITS_MAX_REFS = 3;
+        const referenceFiles = [];
+        for (let i = 1; i <= 32 && referenceFiles.length < IMAGE_EDITS_MAX_REFS; i++) {
+            const ref = files[`image${i}`];
+            if (ref) referenceFiles.push(ref);
+        }
+
+        const maskFile = files.mask;
+
+        logger.info(`[Image Edits] Received request: model=${model}, n=${n}, response_format=${response_format}, hasPrompt=${!!prompt}, hasImage=${!!imageFile}, refs=${referenceFiles.length}, hasMask=${!!maskFile}${size ? `, size=${size}` : ''}, fields=${JSON.stringify(Object.keys(fields))}, fileKeys=${JSON.stringify(Object.keys(files))}`);
 
         if (!SUPPORTED_IMAGE_MODELS.has(model)) {
             logger.warn(`[Image Edits] Unsupported model: ${model}`);
@@ -475,16 +527,36 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
         const {buffer, mimetype} = imageFile;
         const imageUrl = `data:${mimetype || 'image/png'};base64,${buffer.toString('base64')}`;
 
+        // Primary image is the editing target; references condition style/
+        // materials/atmosphere; mask (if any) localizes the edit. All pass
+        // through as image_url parts — downstream Gemini/Claude converters
+        // already iterate over all image_url parts in the message content
+        // array, so no converter change is needed.
+        //
+        // Order matters: the mask is appended LAST so the positional
+        // instruction ("the final image is a mask…") is unambiguous.
+        const effectivePrompt = buildPromptWithImageRoles({
+            prompt,
+            refCount: referenceFiles.length,
+            hasMask: !!maskFile,
+        });
+        const contentParts = [
+            { type: 'text', text: effectivePrompt },
+            { type: 'image_url', image_url: { url: imageUrl } },
+        ];
+        for (const ref of referenceFiles) {
+            const refUrl = `data:${ref.mimetype || 'image/png'};base64,${ref.buffer.toString('base64')}`;
+            contentParts.push({ type: 'image_url', image_url: { url: refUrl } });
+        }
+        if (maskFile) {
+            const maskUrl = `data:${maskFile.mimetype || 'image/png'};base64,${maskFile.buffer.toString('base64')}`;
+            contentParts.push({ type: 'image_url', image_url: { url: maskUrl } });
+        }
+
         // 构造虚拟 OpenAI 对话请求，参考对话接口实现自动转换
         const virtualOpenAIRequest = {
             model,
-            messages: [{
-                role: 'user',
-                content: [
-                    { type: 'text', text: prompt },
-                    { type: 'image_url', image_url: { url: imageUrl } }
-                ]
-            }],
+            messages: [{ role: 'user', content: contentParts }],
             n,
             size,
             response_format,
@@ -527,7 +599,7 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
             });
         }
 
-        logger.info(`[Image Edits] model=${model}, protocol=${finalProviderProtocol}, n=${n}, response_format=${response_format}, imageSize=${Math.round(buffer.length / 1024)}KB${size ? `, size=${size}` : ''}`);
+        logger.info(`[Image Edits] model=${model}, protocol=${finalProviderProtocol}, n=${n}, response_format=${response_format}, imageSize=${Math.round(buffer.length / 1024)}KB, refs=${referenceFiles.length}, mask=${!!maskFile}${size ? `, size=${size}` : ''}`);
 
         const imageRequests = Array.from({ length: n }, () =>
             service.generateContent(model, { ...codexRequestBody })
