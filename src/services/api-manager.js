@@ -489,6 +489,7 @@ async function handleImageEditsRequest(req, res, currentConfig, providerPoolMana
             size,
             response_format,
             _imageSize: size,
+            _aspectRatio: fields.aspect_ratio,
             _monitorRequestId: currentConfig._monitorRequestId // 注入监控 ID
         };
 

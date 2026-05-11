@@ -328,7 +328,12 @@ function geminiToAntigravity(modelName, payload, projectId) {
         if (!template.request.generationConfig.imageConfig) {
             template.request.generationConfig.imageConfig = {};
         }
-        template.request.generationConfig.imageConfig.imageSize = '4K';
+        template.request.generationConfig.imageConfig.imageSize = template.request._imageSize || '4K';
+        if (template.request._aspectRatio) {
+            template.request.generationConfig.imageConfig.aspectRatio = template.request._aspectRatio;
+        }
+        delete template.request._imageSize;
+        delete template.request._aspectRatio;
         if (!template.request.generationConfig.thinkingConfig) {
             template.request.generationConfig.thinkingConfig = {};
         }

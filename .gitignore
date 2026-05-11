@@ -4,6 +4,15 @@ logs/
 .claude/
 CLAUDE.md
 config.json
+
+# RenderSgnl additions
+fly-staging/
+test-*.jpg
+test-*.jpeg
+test-*.png
+test-*.webp
+
+
 provider_pools.json
 custom_models.json
 plugins.json

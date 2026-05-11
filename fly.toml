@@ -1,0 +1,38 @@
+app = "rendersgnl-proxy"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  # ARGS is overridden by `fly secrets set ARGS=...` so the API key isn't in this file.
+
+[[services]]
+  internal_port = 3001
+  protocol = "tcp"
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+  [[services.ports]]
+    port = 80
+    handlers = ["http"]
+    force_https = true
+
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"]
+
+  [services.concurrency]
+    type = "requests"
+    hard_limit = 25
+    soft_limit = 20
+
+[[mounts]]
+  source = "aiclient_configs"
+  destination = "/app/configs"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
